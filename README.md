@@ -30,7 +30,7 @@ The dashboard auto-refreshes every 30 seconds, providing a "Tokyo Night" themed 
 ### 2. Automatic Install
 Clone the repo and run the installer:
 ```bash
-git clone [https://github.com/Bigland-Bash-Dev/matrix-guard.git](https://github.com/Bigland-Bash-Dev/matrix-guard.git)
+git clone https://github.com/Bigland-Bash-Dev/matrix-guard.git
 cd matrix-guard
 chmod +x install.sh
 sudo ./install.sh
