@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net" // Added for IP detection
 	"net/http"
 	"os"
 	"os/exec"
@@ -12,10 +13,8 @@ import (
 	"time"
 )
 
-// Global variable for the web dashboard to display
 var currentStatus string
 
-// getDetailedMemory finds total RAM and identifies the biggest service hog
 func getDetailedMemory() (float64, string) {
 	var total float64
 	var maxMem float64
@@ -45,7 +44,6 @@ func getDetailedMemory() (float64, string) {
 	return total, fmt.Sprintf("%s (%.2fMB)", hogName, maxMem)
 }
 
-// getSwapUsage reads swap info from /proc/meminfo
 func getSwapUsage() string {
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
@@ -65,7 +63,6 @@ func getSwapUsage() string {
 	return fmt.Sprintf("%dMB", used)
 }
 
-// getLoadAvg returns the 1, 5, and 15 minute CPU load
 func getLoadAvg() string {
 	data, err := os.ReadFile("/proc/loadavg")
 	if err != nil {
@@ -78,7 +75,6 @@ func getLoadAvg() string {
 	return "N/A"
 }
 
-// getIOPressure returns Disk I/O pressure stall info
 func getIOPressure() string {
 	data, err := os.ReadFile("/proc/pressure/io")
 	if err != nil {
@@ -92,12 +88,9 @@ func getIOPressure() string {
 }
 
 func main() {
-	// 1. Define Command Line Flags
-	// Default path is still /var/log, but now it's a choice!
 	logPath := flag.String("log", "/var/log/matrix-guard.log", "Path to the log file")
 	flag.Parse()
 
-	// 2. Auto-Provision: Create log file if missing
 	if _, err := os.Stat(*logPath); os.IsNotExist(err) {
 		file, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
@@ -107,7 +100,6 @@ func main() {
 		file.Close()
 	}
 
-	// 3. Setup Logging
 	f, err := os.OpenFile(*logPath, os.O_RDWR|os.O_APPEND, 0666)
 	if err != nil {
 		fmt.Printf("Error opening log file: %v\n", err)
@@ -116,11 +108,22 @@ func main() {
 	defer f.Close()
 	log.SetOutput(f)
 
+	// Dynamic IP detection for the dashboard link
+	displayIP := "localhost"
+	addrs, _ := net.InterfaceAddrs()
+	for _, address := range addrs {
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				displayIP = ipnet.IP.String()
+				break
+			}
+		}
+	}
+
 	fmt.Println("🛡️ Matrix Guard is ACTIVE.")
-	fmt.Println("📊 Dashboard: http://192.168.0.138:8080")
+	fmt.Printf("📊 Dashboard: http://%s:8080\n", displayIP)
 	fmt.Printf("📜 Logging to: %s\n", *logPath)
 
-	// 4. Start Dashboard Server
 	go func() {
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "<html><head><title>Matrix Guard</title><meta http-equiv='refresh' content='30'></head>")
@@ -132,7 +135,6 @@ func main() {
 		log.Fatal(http.ListenAndServe(":8080", nil))
 	}()
 
-	// 5. Guardian Loop
 	ticker := time.NewTicker(30 * time.Second)
 	for range ticker.C {
 		mem, hog := getDetailedMemory()
@@ -146,7 +148,6 @@ func main() {
 
 		log.Println(strings.ReplaceAll(currentStatus, "\n", " | "))
 
-		// SELF-HEALING: Limit checks
 		if strings.Contains(hog, "worker") {
 			var val float64
 			fmt.Sscanf(strings.Split(hog, "(")[1], "%f", &val)
