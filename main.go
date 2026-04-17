@@ -1,19 +1,45 @@
 package main
 
 import (
+	"embed"
 	"flag"
 	"fmt"
+	"html/template"
 	"log"
-	"net" // Added for IP detection
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/shirou/gopsutil/v3/cpu"
 )
 
-var currentStatus string
+//go:embed templates/*
+var resources embed.FS
+
+var (
+	startTime    = time.Now()
+	restartCount = 0 // The new counter
+	currentMem   float64
+	currentHog   string
+	currentSwap  string
+	currentCPU   float64
+)
+
+type PageData struct {
+	Time         string
+	GuardUptime  string
+	Restarts     int // New field for the UI
+	Mem          float64
+	Hog          string
+	Swap         string
+	CPUPercent   float64
+	Percent      float64
+	BarColor     string
+}
 
 func getDetailedMemory() (float64, string) {
 	var total float64
@@ -29,7 +55,6 @@ func getDetailedMemory() (float64, string) {
 				fmt.Sscanf(string(data), "%d", &bytes)
 				mbs := float64(bytes) / 1024 / 1024
 				total += mbs
-
 				if mbs > maxMem {
 					maxMem = mbs
 					parts := strings.Split(path, "/")
@@ -41,14 +66,14 @@ func getDetailedMemory() (float64, string) {
 		}
 		return nil
 	})
-	return total, fmt.Sprintf("%s (%.2fMB)", hogName, maxMem)
+	if hogName == "" {
+		return 0, "No Matrix Workers Detected"
+	}
+	return total, fmt.Sprintf("%s (%.1fMB)", hogName, maxMem)
 }
 
 func getSwapUsage() string {
-	data, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return "N/A"
-	}
+	data, _ := os.ReadFile("/proc/meminfo")
 	lines := strings.Split(string(data), "\n")
 	var total, free int64
 	for _, line := range lines {
@@ -59,56 +84,21 @@ func getSwapUsage() string {
 			fmt.Sscanf(line, "SwapFree: %d", &free)
 		}
 	}
-	used := (total - free) / 1024
-	return fmt.Sprintf("%dMB", used)
-}
-
-func getLoadAvg() string {
-	data, err := os.ReadFile("/proc/loadavg")
-	if err != nil {
-		return "err"
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) >= 3 {
-		return strings.Join(fields[:3], " ")
-	}
-	return "N/A"
-}
-
-func getIOPressure() string {
-	data, err := os.ReadFile("/proc/pressure/io")
-	if err != nil {
-		return "no-psi"
-	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) > 0 {
-		return lines[0]
-	}
-	return "clear"
+	return fmt.Sprintf("%dMB", (total-free)/1024)
 }
 
 func main() {
 	logPath := flag.String("log", "/var/log/matrix-guard.log", "Path to the log file")
 	flag.Parse()
 
-	if _, err := os.Stat(*logPath); os.IsNotExist(err) {
-		file, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY, 0666)
-		if err != nil {
-			fmt.Printf("Critical: Could not create log file at %s. Error: %v\n", *logPath, err)
-			return
-		}
-		file.Close()
-	}
-
-	f, err := os.OpenFile(*logPath, os.O_RDWR|os.O_APPEND, 0666)
+	f, err := os.OpenFile(*logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		fmt.Printf("Error opening log file: %v\n", err)
+		fmt.Printf("Error: %v\n", err)
 		return
 	}
 	defer f.Close()
 	log.SetOutput(f)
 
-	// Dynamic IP detection for the dashboard link
 	displayIP := "localhost"
 	addrs, _ := net.InterfaceAddrs()
 	for _, address := range addrs {
@@ -122,41 +112,61 @@ func main() {
 
 	fmt.Println("🛡️ Matrix Guard is ACTIVE.")
 	fmt.Printf("📊 Dashboard: http://%s:8080\n", displayIP)
-	fmt.Printf("📜 Logging to: %s\n", *logPath)
 
 	go func() {
+		tmpl, _ := template.ParseFS(resources, "templates/index.html")
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, "<html><head><title>Matrix Guard</title><meta http-equiv='refresh' content='30'></head>")
-			fmt.Fprintf(w, "<body style='background:#1a1b26;color:#c0caf5;font-family:monospace;padding:20px;'>")
-			fmt.Fprintf(w, "<h1>Matrix Guard Status</h1><hr>")
-			fmt.Fprintf(w, "<pre style='font-size:1.2em;'>%s</pre>", currentStatus)
-			fmt.Fprintf(w, "</body></html>")
+			percent := (currentMem / 8192) * 100
+			barColor := "#9ece6a"
+			if percent > 80 {
+				barColor = "#f7768e"
+			}
+
+			uptime := time.Since(startTime).Round(time.Second).String()
+
+			data := PageData{
+				Time:         time.Now().Format("15:04:05"),
+				GuardUptime:  uptime,
+				Restarts:     restartCount, // Passing the counter to HTML
+				Mem:          currentMem,
+				Hog:          currentHog,
+				Swap:         currentSwap,
+				CPUPercent:   currentCPU,
+				Percent:      percent,
+				BarColor:     barColor,
+			}
+			tmpl.Execute(w, data)
 		})
 		log.Fatal(http.ListenAndServe(":8080", nil))
 	}()
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	for range ticker.C {
-		mem, hog := getDetailedMemory()
-		swap := getSwapUsage()
-		load := getLoadAvg()
-		io := getIOPressure()
+		currentMem, currentHog = getDetailedMemory()
+		currentSwap = getSwapUsage()
+		cpuUsage, _ := cpu.Percent(0, false)
+		if len(cpuUsage) > 0 {
+			currentCPU = cpuUsage[0]
+		}
 
-		timestamp := time.Now().Format("2006-01-02 15:04:05")
-		currentStatus = fmt.Sprintf("Time: %s\nTotal RAM: %.2f MB\nTop Hog:  %s\nSwap:     %s\nCPU Load: %s\nDisk I/O: %s", 
-			timestamp, mem, hog, swap, load, io)
-
-		log.Println(strings.ReplaceAll(currentStatus, "\n", " | "))
-
-		if strings.Contains(hog, "worker") {
+		// Self-Healing Logic
+		if strings.Contains(currentHog, "worker") {
 			var val float64
-			fmt.Sscanf(strings.Split(hog, "(")[1], "%f", &val)
-			
-			if val > 1150 {
-				serviceName := strings.Split(hog, " ")[0]
-				fmt.Printf("🚑 ALERT: Restarting %s (Used: %.2fMB)\n", serviceName, val)
-				exec.Command("systemctl", "restart", serviceName).Run()
-				log.Printf("SELF-HEAL: Restarted %s at %.2fMB", serviceName, val)
+			parts := strings.Split(currentHog, "(")
+			if len(parts) > 1 {
+				fmt.Sscanf(parts[1], "%f", &val)
+				if val > 1150 {
+					serviceName := strings.TrimSpace(parts[0])
+					log.Printf("🚑 ALERT: Restarting %s (Used: %.2fMB)", serviceName, val)
+
+					// Perform the restart
+					err := exec.Command("systemctl", "restart", serviceName).Run()
+					if err == nil {
+						restartCount++ // Increment only on success
+					} else {
+						log.Printf("❌ ERROR: Failed to restart %s: %v", serviceName, err)
+					}
+				}
 			}
 		}
 	}
